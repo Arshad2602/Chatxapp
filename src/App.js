@@ -18,6 +18,7 @@ import {
   onValue,
   push,
   runTransaction,
+  remove,
 } from "firebase/database";
 import {
   getStorage,
@@ -36,6 +37,7 @@ import {
   FiMoon,
   FiShield,
   FiLogOut,
+  FiTrash2,
 } from "react-icons/fi";
 import "./App.css";
 import ReelsPage from "./ReelsPage";
@@ -91,12 +93,13 @@ export default function App() {
   const [lightboxLoading, setLightboxLoading] = useState(true);
   const [editingUsername, setEditingUsername] = useState(false);
   const [newUsername, setNewUsername] = useState("");
+  const [showDeletePopupId, setShowDeletePopupId] = useState(null);
+  const [showChatMenu, setShowChatMenu] = useState(false); // New state for chat menu
   const messagesEndRef = useRef(null);
   const messagesContainerRef = useRef(null);
   const fileInputRef = useRef(null);
   const profilePicInputRef = useRef(null);
   const [replyingTo, setReplyingTo] = useState(null);
-  const [showDeletePopupId, setShowDeletePopupId] = useState(null);
   const appRef = useRef(null);
   const [theme, setTheme] = useState(
     () => localStorage.getItem("app_theme") || "dark"
@@ -117,23 +120,22 @@ export default function App() {
         console.log("onAuthStateChanged: User snapshot exists:", snap.exists());
 
         if (snap.exists()) {
-          // Existing user: retrieve username and uniqueId from database
           const val = snap.val();
           console.log("onAuthStateChanged: Database data:", val);
           setUsername(val.username || currentUser.displayName || "User");
           setUniqueId(val.uniqueId);
           await update(userRef, { isOnline: true });
         } else {
-          // New user: should only happen during signup, handled in handleSignUp
           console.log("onAuthStateChanged: No database entry, waiting for signup");
           setUsername(currentUser.displayName || "User");
-          setUniqueId(null); // Will be set during signup
+          setUniqueId(null);
         }
       } else {
         console.log("onAuthStateChanged: No user logged in");
         setUser(null);
         setUniqueId(null);
         setUsername("");
+        setSelectedUser(null);
       }
     });
 
@@ -158,11 +160,11 @@ export default function App() {
     });
   }, []);
 
-  // Inbox
+  // Inbox - Update without redirecting
   useEffect(() => {
     if (!user) return;
     const chatsRef = ref(db, "privateChats");
-    onValue(chatsRef, (snapshot) => {
+    const unsubscribe = onValue(chatsRef, (snapshot) => {
       const data = snapshot.val() || {};
       const userChats = [];
       Object.entries(data).forEach(([chatId, msgs]) => {
@@ -180,6 +182,7 @@ export default function App() {
       );
       setInbox(userChats);
     });
+    return () => unsubscribe();
   }, [user]);
 
   // Messages auto-scroll
@@ -187,14 +190,15 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Load chat messages
+  // Load chat messages only for the selected user
   useEffect(() => {
     if (!user || !selectedUser) return;
     const chatId = [user.uid, selectedUser.uid].sort().join("_");
     const chatRef = ref(db, `privateChats/${chatId}`);
-    onValue(chatRef, (snapshot) => {
+    const unsubscribe = onValue(chatRef, (snapshot) => {
       setMessages(snapshot.val() ? Object.values(snapshot.val()) : []);
     });
+    return () => unsubscribe();
   }, [selectedUser, user]);
 
   // Search
@@ -262,7 +266,6 @@ export default function App() {
       const res = await createUserWithEmailAndPassword(auth, email, password);
       console.log("handleSignUp: User created, UID:", res.user.uid);
 
-      // Set displayName in Firebase Auth
       await updateProfile(res.user, { displayName: username });
       console.log("handleSignUp: displayName set to:", username);
 
@@ -270,14 +273,12 @@ export default function App() {
       const lastIdRef = ref(db, "lastUniqueId");
       let newId;
 
-      // Check if user already exists (safeguard)
       const snap = await get(userRef);
       console.log("handleSignUp: User exists in DB:", snap.exists());
       if (snap.exists()) {
         newId = snap.val().uniqueId;
         console.log("handleSignUp: Using existing uniqueId:", newId);
       } else {
-        // Assign new uniqueId using transaction
         await runTransaction(lastIdRef, (currentId) => {
           return (currentId || 100000) + 1;
         }).then((result) => {
@@ -311,6 +312,9 @@ export default function App() {
       console.log("handleLogin: Attempting login for email:", email);
       await signInWithEmailAndPassword(auth, email, password);
       console.log("handleLogin: Login successful");
+      setSettingsPage(false);
+      setShowProfile(false);
+      setShowReels(false);
     } catch (err) {
       console.error("handleLogin: Error:", err);
       alert(err.message);
@@ -393,7 +397,45 @@ export default function App() {
     if (!selectedUser) return;
     const chatId = [user.uid, selectedUser.uid].sort().join("_");
     const msgRef = ref(db, `privateChats/${chatId}/${msgKey}`);
-    await update(msgRef, { text: "This message was deleted", deleted: true });
+    await remove(msgRef);
+    setShowDeletePopupId(null);
+  };
+
+  const deleteChat = async () => {
+    if (!selectedUser) return;
+    if (!window.confirm("Are you sure you want to delete this chat? This action cannot be undone.")) return;
+
+    try {
+      const chatId = [user.uid, selectedUser.uid].sort().join("_");
+      const chatRef = ref(db, `privateChats/${chatId}`);
+      await remove(chatRef);
+      setInbox((prev) => prev.filter((chat) => chat.chatId !== chatId));
+      setSelectedUser(null);
+      setMessages([]);
+      setShowChatMenu(false);
+      alert("Chat deleted successfully");
+    } catch (err) {
+      console.error("Error deleting chat:", err);
+      alert("Failed to delete chat");
+    }
+  };
+
+  const deleteAllChats = async () => {
+    if (!window.confirm("Are you sure you want to delete all chats? This action cannot be undone.")) return;
+
+    try {
+      for (const chat of inbox) {
+        const chatRef = ref(db, `privateChats/${chat.chatId}`);
+        await remove(chatRef);
+      }
+      setInbox([]);
+      setSelectedUser(null);
+      setMessages([]);
+      alert("All chats deleted successfully");
+    } catch (err) {
+      console.error("Error deleting chats:", err);
+      alert("Failed to delete some chats");
+    }
   };
 
   const sendFile = async (e) => {
@@ -626,7 +668,7 @@ export default function App() {
                   color: theme === "dark" ? "#fff" : "var(--text)",
                 }}
               >
-                <p className="text-sm font-medium " style={{ color: "var(--muted)" }}>
+                <p className="text-sm font-medium" style={{ color: "var(--muted)" }}>
                   Account
                 </p>
 
@@ -652,6 +694,18 @@ export default function App() {
                   <div className="flex items-center gap-3">
                     <FiMessageSquare size={20} style={{ color: "var(--primary)" }} />
                     <span>Chat History</span>
+                  </div>
+                  <FiChevronRight size={18} style={{ color: "var(--muted)" }} />
+                </button>
+
+                <button
+                  onClick={deleteAllChats}
+                  className="w-full flex justify-between items-center p-3 rounded-xl hover:opacity-95 transition-all"
+                  style={{ background: "transparent", color: "var(--text)" }}
+                >
+                  <div className="flex items-center gap-3">
+                    <FiTrash2 size={20} style={{ color: "red" }} />
+                    <span style={{ color: "red" }}>Delete All Chats</span>
                   </div>
                   <FiChevronRight size={18} style={{ color: "var(--muted)" }} />
                 </button>
@@ -898,7 +952,7 @@ export default function App() {
       )}
 
       {/* Search & Inbox */}
-      {!selectedUser && (
+      {!selectedUser && !settingsPage && !showProfile && !showReels && (
         <div className="w-full max-w-[420px] mb-4">
           <div className="flex gap-2 mb-2 flex-col sm:flex-row p-1 rounded-full">
             <input
@@ -938,10 +992,11 @@ export default function App() {
               {inbox.map((chat) => {
                 const otherUser = usersMap[chat.otherUid];
                 if (!otherUser) return null;
+
                 return (
                   <div
                     key={chat.chatId}
-                    className="flex items-center p-2 hover:opacity-95 cursor-pointer"
+                    className="flex items-center p-2 hover:opacity-95 relative group"
                     onClick={() => startPrivateChat(otherUser)}
                   >
                     <div className="w-10 h-10 rounded-full flex items-center justify-center mr-3" style={{ background: "var(--primary)", color: "#fff" }}>
@@ -974,7 +1029,10 @@ export default function App() {
           >
             <div className="flex items-center gap-2">
               <button
-                onClick={() => setSelectedUser(null)}
+                onClick={() => {
+                  setSelectedUser(null);
+                  setShowChatMenu(false);
+                }}
                 className="text-xl p-1 rounded-full"
                 style={{ color: "var(--muted)" }}
               >
@@ -999,7 +1057,7 @@ export default function App() {
               <span className="font-semibold">{selectedUser.username}</span>
             </div>
 
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-4 relative">
               <button className="hover:bg-gray-700 p-2 rounded-full">
                 <svg
                   className="h-5 w-5"
@@ -1032,7 +1090,10 @@ export default function App() {
                 </svg>
               </button>
 
-              <button className="hover:bg-gray-700 p-2 rounded-full">
+              <button
+                className="hover:bg-gray-700 p-2 rounded-full relative"
+                onClick={() => setShowChatMenu(!showChatMenu)}
+              >
                 <svg
                   className="h-5 w-5"
                   viewBox="0 0 20 20"
@@ -1041,6 +1102,36 @@ export default function App() {
                   <path d="M6 10a2 2 0 11-4 0 2 2 0 014 0zm6 0a2 2 0 11-4 0 2 2 0 014 0zm6 0a2 2 0 11-4 0 2 2 0 014 0z" />
                 </svg>
               </button>
+
+              {showChatMenu && (
+                <div
+                  className={`absolute z-50 w-[160px] rounded-2xl shadow-lg px-1 py-1 select-none top-12 right-0
+                    ${theme === "dark" 
+                      ? "bg-gray-800 border border-gray-700" 
+                      : "bg-white border border-gray-300"}`}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div
+                    className={`absolute -top-2 right-4 w-3 h-3 rotate-45
+                      ${theme === "dark"
+                        ? "bg-gray-800 border-l border-t border-gray-700"
+                        : "bg-white border-l border-t border-gray-300"
+                      }`}
+                  ></div>
+
+                  <button
+                    onClick={deleteChat}
+                    className={`flex items-center w-full px-3 py-2 rounded-xl text-sm transition duration-150
+                      ${theme === "dark"
+                        ? "text-red-400 hover:bg-gray-700"
+                        : "text-red-500 hover:bg-red-100"
+                      }`}
+                  >
+                    <FiTrash2 size={14} className="mr-2" />
+                    Delete Chat
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1048,7 +1139,10 @@ export default function App() {
             ref={messagesContainerRef}
             className="flex-grow p-1 overflow-y-auto space-y-3"
             style={{ paddingBottom: "60px" }}
-            onClick={() => setShowDeletePopupId(null)}
+            onClick={() => {
+              setShowDeletePopupId(null);
+              setShowChatMenu(false);
+            }}
           >
             {messages.map((msg, i) => {
               const isOwn = msg.senderUid === user.uid;
@@ -1229,11 +1323,12 @@ export default function App() {
                         }}
                         onClick={(e) => e.stopPropagation()}
                       >
-                        <div className={`absolute -bottom-2 left-1/2 -translate-x-1/2 w-3 h-3 rotate-45
-                          ${theme === "dark"
-                            ? "bg-gray-800 border-l border-t border-gray-700"
-                            : "bg-white border-l border-t border-gray-300"
-                          }`}
+                        <div
+                          className={`absolute -bottom-2 left-1/2 -translate-x-1/2 w-3 h-3 rotate-45
+                            ${theme === "dark"
+                              ? "bg-gray-800 border-l border-t border-gray-700"
+                              : "bg-white border-l border-t border-gray-300"
+                            }`}
                         ></div>
 
                         <button
@@ -1413,7 +1508,7 @@ export default function App() {
                   style={{ background: "var(--primary)", color: "#fff" }}
                 >
                   <svg
-                    className="w-5 h-5"
+                    className="w-5 w-5"
                     fill="none"
                     viewBox="0 0 24 24"
                     stroke="currentColor"
